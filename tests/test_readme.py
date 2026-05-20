@@ -251,6 +251,59 @@ def test_directional_reparam():
 
     quantized, indices, _ = rq(x)
 
+@pytest.mark.parametrize('train', (True, False))
+def test_sf_diveq(train):
+    from torch import nn
+    from vector_quantize_pytorch import VectorQuantize, ResidualVQ
+
+    vq = VectorQuantize(
+        dim = 32,
+        codebook_size = 64,
+        sf_diveq = True
+    )
+
+    assert vq.sf_diveq
+    assert not vq.rotation_trick
+    assert vq.learnable_codebook
+    assert not vq.ema_update
+
+    x = torch.randn(2, 16, 32).requires_grad_()
+
+    vq.train(train)
+    quantized, indices, loss = vq(x)
+
+    assert quantized.shape == x.shape
+    assert indices.shape == x.shape[:2]
+    assert indices.amax() < 63
+
+    if train:
+        (quantized.mean() + loss).backward()
+
+    vq_bridge = nn.Sequential(nn.LayerNorm(32), nn.Linear(32, 32))
+
+    bridged_vq = VectorQuantize(
+        dim = 32,
+        codebook_size = 64,
+        sf_diveq = True,
+        vq_bridge = vq_bridge
+    )
+
+    quantized, indices, loss = bridged_vq(x)
+    assert quantized.shape == x.shape
+    assert indices.amax() < 63
+    (quantized.mean() + loss).backward()
+
+    rq = ResidualVQ(
+        dim = 32,
+        num_quantizers = 2,
+        codebook_size = 32,
+        sf_diveq = True
+    )
+
+    quantized, indices, loss = rq(x)
+    assert quantized.shape == x.shape
+    assert indices.shape == (*x.shape[:2], 2)
+
 @pytest.mark.parametrize('preserve_symmetry', (True, False))
 @pytest.mark.parametrize('bound_hard_clamp', (True, False))
 def test_fsq(

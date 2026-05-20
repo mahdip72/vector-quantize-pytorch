@@ -326,6 +326,56 @@ def directional_reparam(src, tgt, noise_variance = 5e-3):
 
     return src + unit_noised_dir * error_dir_norm
 
+def space_filling_directional_reparam(src, codebook_first, codebook_second, interp, noise_variance = 5e-3):
+    noise = sqrt(noise_variance) * torch.randn_like(src)
+
+    direction_first = codebook_first - src
+    direction_second = codebook_second - src
+
+    unit_direction_first = l2norm(direction_first + noise).detach()
+    unit_direction_second = l2norm(direction_second + noise).detach()
+
+    error_norm_first = direction_first.norm(dim = -1, keepdim = True)
+    error_norm_second = direction_second.norm(dim = -1, keepdim = True)
+
+    return src + (1. - interp) * unit_direction_first * error_norm_first + interp * unit_direction_second * error_norm_second
+
+def batched_embedding(indices, embeds):
+    indices = repeat(indices, 'h n -> h n d', d = embeds.shape[-1])
+    return embeds.gather(1, indices)
+
+def nearest_line_segment(src, codebook):
+    codebook_first, codebook_second = codebook[:, :-1], codebook[:, 1:]
+    segment = codebook_second - codebook_first
+    segment_norm_sq = segment.square().sum(dim = -1).clamp(min = 1e-12)
+
+    src_dot_segment = einsum('h n d, h c d -> h n c', src, segment)
+    first_dot_segment = einsum('h c d, h c d -> h c', codebook_first, segment)
+
+    interp = ((src_dot_segment - rearrange(first_dot_segment, 'h c -> h 1 c')) / rearrange(segment_norm_sq, 'h c -> h 1 c')).clamp(0., 1.)
+
+    src_norm_sq = src.square().sum(dim = -1, keepdim = True)
+    first_norm_sq = codebook_first.square().sum(dim = -1)
+    src_dot_first = einsum('h n d, h c d -> h n c', src, codebook_first)
+
+    projected_norm_sq = (
+        rearrange(first_norm_sq, 'h c -> h 1 c') +
+        2. * interp * rearrange(first_dot_segment, 'h c -> h 1 c') +
+        interp.square() * rearrange(segment_norm_sq, 'h c -> h 1 c')
+    )
+
+    src_dot_projected = src_dot_first + interp * src_dot_segment
+    dist = -(src_norm_sq + projected_norm_sq - 2. * src_dot_projected).clamp(min = 1e-8).sqrt()
+
+    embed_ind = dist.argmax(dim = -1)
+    interp = interp.gather(-1, rearrange(embed_ind, 'h n -> h n 1'))
+
+    codebook_first = batched_embedding(embed_ind, codebook_first)
+    codebook_second = batched_embedding(embed_ind, codebook_second)
+    quantize = codebook_first + interp * (codebook_second - codebook_first)
+
+    return quantize, embed_ind, dist
+
 # distributed helpers
 
 @cache
@@ -367,7 +417,9 @@ class Codebook(Module):
         affine_param_batch_decay = 0.99,
         affine_param_codebook_decay = 0.9,
         use_cosine_sim = False,
-        vq_bridge: Module | None = None
+        vq_bridge: Module | None = None,
+        sf_diveq = False,
+        sf_diveq_variance = 5e-3
     ):
         super().__init__()
         self.transform_input = identity if not use_cosine_sim else l2norm
@@ -424,6 +476,8 @@ class Codebook(Module):
         # fvq
 
         self.vq_bridge = vq_bridge
+        self.sf_diveq = sf_diveq
+        self.sf_diveq_variance = sf_diveq_variance
 
         # affine related params
 
@@ -713,7 +767,33 @@ class Codebook(Module):
         # handle maybe implicit neural codebook
         # and calculate distance
 
-        if exists(codebook_transform_fn):
+        if self.sf_diveq:
+            assert not exists(codebook_transform_fn), 'SF-DiVeQ is not compatible with implicit neural codebooks yet'
+            assert not exists(topk), 'SF-DiVeQ is not compatible with topk code lookup yet'
+
+            if self.training:
+                codebook_first, codebook_second = embed[:, :-1], embed[:, 1:]
+                interp = torch.rand(*codebook_first.shape[:-1], 1, device = embed.device, dtype = embed.dtype)
+                dithered_embed = codebook_first.lerp(codebook_second, interp)
+
+                dist = -cdist(flatten, dithered_embed)
+                embed_ind, embed_onehot = self.gumbel_sample(dist, dim = -1, temperature = sample_codebook_temp, training = self.training)
+
+                codebook_first = einsum('h n c, h c d -> h n d', embed_onehot, codebook_first)
+                codebook_second = einsum('h n c, h c d -> h n d', embed_onehot, codebook_second)
+                interp = einsum('h n c, h c d -> h n d', embed_onehot, interp)
+
+                quantize = space_filling_directional_reparam(flatten, codebook_first, codebook_second, interp, self.sf_diveq_variance)
+
+                codebook_onehot = flatten.new_zeros(*embed_onehot.shape[:-1], self.codebook_size)
+                codebook_onehot[..., :-1] = embed_onehot * (1. - interp)
+                codebook_onehot[..., 1:] = codebook_onehot[..., 1:] + embed_onehot * interp
+                embed_onehot = codebook_onehot
+            else:
+                quantize, embed_ind, dist = nearest_line_segment(flatten, embed)
+                embed_onehot = F.one_hot(embed_ind, self.codebook_size).type(dtype)
+
+        elif exists(codebook_transform_fn):
             transformed_embed = codebook_transform_fn(embed)
             transformed_embed = rearrange(transformed_embed, 'h b n c d -> h (b n) c d')
 
@@ -729,43 +809,47 @@ class Codebook(Module):
             else:
                  dist = -cdist(flatten, embed)
 
-        # sample or argmax depending on temperature
-
-        embed_ind, embed_onehot = self.gumbel_sample(dist, dim = -1, topk = topk, temperature = sample_codebook_temp, training = self.training)
-
-        if exists(topk):
-            embed_ind = unpack_one(embed_ind, 'h * k')
-        else:
+        if self.sf_diveq:
+            quantize = unpack_one(quantize, 'h * d')
             embed_ind = unpack_one(embed_ind, 'h *')
-
-        if exists(codebook_transform_fn):
-            transformed_embed = unpack_one(transformed_embed, 'h * c d')
-
-        if self.training:
-            if exists(topk):
-                unpacked_onehot = unpack_one(embed_onehot, 'h * k c')
-            else:
-                unpacked_onehot = unpack_one(embed_onehot, 'h * c')
-
-            if exists(codebook_transform_fn):
-                quantize = einsum('h b n ... c, h b n c d -> h b n ... d', unpacked_onehot, transformed_embed)
-            else:
-                quantize = einsum('h b n ... c, h c d -> h b n ... d', unpacked_onehot, embed)
-
         else:
-            if exists(codebook_transform_fn):
-                # quantize = einx.get_at('h b n [c] d, h b n -> h b n d', transformed_embed, embed_ind)
+            # sample or argmax depending on temperature
 
-                repeated_embed_ind = repeat(embed_ind, 'h b n -> h b n 1 d', d = transformed_embed.shape[-1])
-                quantize = transformed_embed.gather(-2, repeated_embed_ind)
-                quantize = rearrange(quantize, 'h b n 1 d -> h b n d')
+            embed_ind, embed_onehot = self.gumbel_sample(dist, dim = -1, topk = topk, temperature = sample_codebook_temp, training = self.training)
+
+            if exists(topk):
+                embed_ind = unpack_one(embed_ind, 'h * k')
+            else:
+                embed_ind = unpack_one(embed_ind, 'h *')
+
+            if exists(codebook_transform_fn):
+                transformed_embed = unpack_one(transformed_embed, 'h * c d')
+
+            if self.training:
+                if exists(topk):
+                    unpacked_onehot = unpack_one(embed_onehot, 'h * k c')
+                else:
+                    unpacked_onehot = unpack_one(embed_onehot, 'h * c')
+
+                if exists(codebook_transform_fn):
+                    quantize = einsum('h b n ... c, h b n c d -> h b n ... d', unpacked_onehot, transformed_embed)
+                else:
+                    quantize = einsum('h b n ... c, h c d -> h b n ... d', unpacked_onehot, embed)
 
             else:
-                # quantize = einx.get_at('h [c] d, h b n -> h b n d', embed, embed_ind)
+                if exists(codebook_transform_fn):
+                    # quantize = einx.get_at('h b n [c] d, h b n -> h b n d', transformed_embed, embed_ind)
 
-                repeated_embed = repeat(embed, 'h c d -> h b c d', b = embed_ind.shape[1])
-                repeated_embed_ind = repeat(embed_ind, 'h b n -> h b n d', d = embed.shape[-1])
-                quantize = repeated_embed.gather(-2, repeated_embed_ind)
+                    repeated_embed_ind = repeat(embed_ind, 'h b n -> h b n 1 d', d = transformed_embed.shape[-1])
+                    quantize = transformed_embed.gather(-2, repeated_embed_ind)
+                    quantize = rearrange(quantize, 'h b n 1 d -> h b n d')
+
+                else:
+                    # quantize = einx.get_at('h [c] d, h b n -> h b n d', embed, embed_ind)
+
+                    repeated_embed = repeat(embed, 'h c d -> h b c d', b = embed_ind.shape[1])
+                    repeated_embed_ind = repeat(embed_ind, 'h b n -> h b n d', d = embed.shape[-1])
+                    quantize = repeated_embed.gather(-2, repeated_embed_ind)
 
         if self.training and update_usage and not freeze_codebook and not exists(topk):
             self.update_codebook(flatten, embed_onehot, mask = mask, ema_update_weight = ema_update_weight, accum_ema_update = accum_ema_update, ema_update = ema_update)
@@ -819,6 +903,8 @@ class VectorQuantize(Module):
         rotation_trick = None,       # propagate grads through VQ layer w/ rotation trick: https://arxiv.org/abs/2410.06424 by @cfifty
         directional_reparam = False, # add the difference between the nearest code and input vector, with some noise on the direction
         directional_reparam_variance = 5e-3,
+        sf_diveq = False,            # space-filling variant of DiVeQ that quantizes along codeword line segments
+        sf_diveq_variance = 5e-3,
         sync_codebook = None,
         sync_affine_param = False,
         ema_update = None,
@@ -837,9 +923,11 @@ class VectorQuantize(Module):
 
         # defaults
 
-        ema_update = default(ema_update, not directional_reparam and not exists(vq_bridge))
-        learnable_codebook = default(learnable_codebook, directional_reparam or exists(vq_bridge))
-        rotation_trick = default(rotation_trick, not directional_reparam and dim > 1) # only use rotation trick if feature dimension greater than 1
+        has_diveq = directional_reparam or sf_diveq
+
+        ema_update = default(ema_update, not has_diveq and not exists(vq_bridge))
+        learnable_codebook = default(learnable_codebook, has_diveq or exists(vq_bridge))
+        rotation_trick = default(rotation_trick, not has_diveq and dim > 1) # only use rotation trick if feature dimension greater than 1
 
         # basic variables
 
@@ -863,7 +951,7 @@ class VectorQuantize(Module):
 
         self.eps = eps
 
-        self.has_commitment_loss = commitment_weight > 0. and not directional_reparam
+        self.has_commitment_loss = commitment_weight > 0. and not has_diveq
         self.commitment_weight = commitment_weight
         self.commitment_use_cross_entropy_loss = commitment_use_cross_entropy_loss # whether to use cross entropy loss to codebook as commitment loss
 
@@ -881,12 +969,17 @@ class VectorQuantize(Module):
         self.codebook_diversity_temperature = codebook_diversity_temperature
         self.codebook_diversity_loss_weight = codebook_diversity_loss_weight
 
-        assert at_most_one_of(straight_through, rotation_trick, directional_reparam)
+        assert at_most_one_of(straight_through, rotation_trick, directional_reparam, sf_diveq)
         self.rotation_trick = rotation_trick
 
         assert not (directional_reparam and threshold_ema_dead_code == 0), 'periodic dead code replacement should be enabled when differential reparam method is turned on'
         self.directional_reparam = directional_reparam
         self.directional_reparam_variance = directional_reparam_variance
+        self.sf_diveq = sf_diveq
+        self.sf_diveq_variance = sf_diveq_variance
+
+        assert not (sf_diveq and codebook_size < 2), 'SF-DiVeQ requires at least 2 codes'
+        assert not (sf_diveq and use_cosine_sim), 'SF-DiVeQ is only compatible with euclidean distance'
 
         assert not (straight_through and learnable_codebook), 'gumbel straight through not allowed when learning the codebook'
         assert not (ema_update and learnable_codebook), 'learnable codebook not compatible with EMA update'
@@ -926,7 +1019,9 @@ class VectorQuantize(Module):
             ema_update = ema_update,
             manual_ema_update = manual_ema_update,
             use_cosine_sim = use_cosine_sim,
-            vq_bridge = vq_bridge
+            vq_bridge = vq_bridge,
+            sf_diveq = sf_diveq,
+            sf_diveq_variance = sf_diveq_variance
         )
 
         if affine_param:
@@ -1209,7 +1304,7 @@ class VectorQuantize(Module):
                     quantize = rotate_to(x, quantize)
                 elif self.directional_reparam:
                     quantize = directional_reparam(x, quantize, self.directional_reparam_variance)
-                else:
+                elif not self.sf_diveq:
                     # standard STE to get gradients through VQ layer.
                     quantize = straight_through(x, quantize)
 

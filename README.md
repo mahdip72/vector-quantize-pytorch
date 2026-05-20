@@ -149,6 +149,19 @@ vq_layer = VectorQuantize(
 )
 ```
 
+The same paper also proposes SF-DiVeQ, a space-filling variant that quantizes along line segments between neighboring codewords. This can be enabled with `sf_diveq = True`. It is mutually exclusive with `rotation_trick`, `straight_through`, and `directional_reparam`.
+
+```python
+from vector_quantize_pytorch import VectorQuantize
+
+vq_layer = VectorQuantize(
+    dim = 256,
+    codebook_size = 256,
+    sf_diveq = True,
+    sf_diveq_variance = 5e-3
+)
+```
+
 ## Increasing codebook usage
 
 This repository will contain a few techniques from various papers to combat "dead" codebook entries, which is a common problem when using vector quantizers.
