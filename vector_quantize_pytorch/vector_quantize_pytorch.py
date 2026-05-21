@@ -419,7 +419,8 @@ class Codebook(Module):
         use_cosine_sim = False,
         vq_bridge: Module | None = None,
         sf_diveq = False,
-        sf_diveq_variance = 5e-3
+        sf_diveq_variance = 5e-3,
+        sf_diveq_train_only = False
     ):
         super().__init__()
         self.transform_input = identity if not use_cosine_sim else l2norm
@@ -478,6 +479,7 @@ class Codebook(Module):
         self.vq_bridge = vq_bridge
         self.sf_diveq = sf_diveq
         self.sf_diveq_variance = sf_diveq_variance
+        self.sf_diveq_train_only = sf_diveq_train_only
 
         # affine related params
 
@@ -767,7 +769,9 @@ class Codebook(Module):
         # handle maybe implicit neural codebook
         # and calculate distance
 
-        if self.sf_diveq:
+        use_sf_diveq = self.sf_diveq and (self.training or not self.sf_diveq_train_only)
+
+        if use_sf_diveq:
             assert not exists(codebook_transform_fn), 'SF-DiVeQ is not compatible with implicit neural codebooks yet'
             assert not exists(topk), 'SF-DiVeQ is not compatible with topk code lookup yet'
 
@@ -809,7 +813,7 @@ class Codebook(Module):
             else:
                  dist = -cdist(flatten, embed)
 
-        if self.sf_diveq:
+        if use_sf_diveq:
             quantize = unpack_one(quantize, 'h * d')
             embed_ind = unpack_one(embed_ind, 'h *')
         else:
@@ -905,6 +909,7 @@ class VectorQuantize(Module):
         directional_reparam_variance = 5e-3,
         sf_diveq = False,            # space-filling variant of DiVeQ that quantizes along codeword line segments
         sf_diveq_variance = 5e-3,
+        sf_diveq_train_only = False, # only use SF-DiVeQ during training, and use normal codeword lookup at eval time
         sync_codebook = None,
         sync_affine_param = False,
         ema_update = None,
@@ -977,6 +982,7 @@ class VectorQuantize(Module):
         self.directional_reparam_variance = directional_reparam_variance
         self.sf_diveq = sf_diveq
         self.sf_diveq_variance = sf_diveq_variance
+        self.sf_diveq_train_only = sf_diveq_train_only
 
         assert not (sf_diveq and codebook_size < 2), 'SF-DiVeQ requires at least 2 codes'
         assert not (sf_diveq and use_cosine_sim), 'SF-DiVeQ is only compatible with euclidean distance'
@@ -1021,7 +1027,8 @@ class VectorQuantize(Module):
             use_cosine_sim = use_cosine_sim,
             vq_bridge = vq_bridge,
             sf_diveq = sf_diveq,
-            sf_diveq_variance = sf_diveq_variance
+            sf_diveq_variance = sf_diveq_variance,
+            sf_diveq_train_only = sf_diveq_train_only
         )
 
         if affine_param:

@@ -304,6 +304,18 @@ def test_sf_diveq(train):
     assert quantized.shape == x.shape
     assert indices.shape == (*x.shape[:2], 2)
 
+    train_only_vq = VectorQuantize(
+        dim = 32,
+        codebook_size = 64,
+        sf_diveq = True,
+        sf_diveq_train_only = True
+    )
+
+    train_only_vq.eval()
+
+    quantized, indices, _ = train_only_vq(x.detach())
+    assert torch.allclose(quantized, train_only_vq.get_output_from_indices(indices), atol = 1e-5)
+
 @pytest.mark.parametrize('preserve_symmetry', (True, False))
 @pytest.mark.parametrize('bound_hard_clamp', (True, False))
 def test_fsq(
